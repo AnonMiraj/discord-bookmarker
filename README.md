@@ -30,7 +30,6 @@ Install dependencies:
 ```bash
 go get github.com/bwmarrin/discordgo
 go get github.com/joho/godotenv
-go get github.com/mattn/go-sqlite3
 ```
 
 ## Logging

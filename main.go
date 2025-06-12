@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -12,59 +11,6 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
-	_ "github.com/mattn/go-sqlite3"
-)
-
-const (
-	CREATE_USER_BOOKMARKS_TABLE = `
-CREATE TABLE IF NOT EXISTS user_bookmarks (
-    guild_id TEXT NOT NULL,
-    channel_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
-    message_link TEXT NOT NULL,
-    dm_message_id TEXT NOT NULL,
-    bookmark_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, message_id)
-);`
-
-	CREATE_BOOKMARKED_MESSAGES_TABLE = `
-CREATE TABLE IF NOT EXISTS bookmarked_messages (
-    guild_id TEXT NOT NULL,
-    channel_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
-    message_author_id TEXT NOT NULL,
-    message_link TEXT NOT NULL,
-    bookmark_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, message_id)
-);`
-
-	CHECK_BOOKMARK_EXISTS_QUERY = `
-SELECT 1 FROM user_bookmarks WHERE user_id = ? AND message_id = ?;`
-
-	INSERT_USER_BOOKMARK_QUERY = `
-INSERT INTO user_bookmarks (guild_id, channel_id, user_id, message_id, message_link, dm_message_id)
-VALUES (?, ?, ?, ?, ?, ?);`
-
-	UPDATE_BOOKMARK_COUNT_QUERY = `
-INSERT INTO bookmarked_messages (guild_id, channel_id, message_id, message_author_id, message_link, bookmark_count)
-VALUES (?, ?, ?, ?, ?, 1)
-ON CONFLICT (guild_id, message_id) DO UPDATE SET bookmark_count = bookmark_count + 1;`
-	DELETE_USER_BOOKMARK_QUERY = `
-DELETE FROM user_bookmarks WHERE user_id = ? AND dm_message_id = ?;`
-
-	DECREMENT_BOOKMARK_COUNT_QUERY = `
-UPDATE bookmarked_messages 
-SET bookmark_count = bookmark_count - 1 
-WHERE message_id = (
-    SELECT message_id FROM user_bookmarks WHERE user_id = ? AND dm_message_id = ?
-);`
-
-	DELETE_ZERO_BOOKMARKS_QUERY = `
-DELETE FROM bookmarked_messages WHERE bookmark_count <= 0;`
-
-	GET_DM_MESSAGE_ID_QUERY = `
-SELECT dm_message_id, channel_id FROM user_bookmarks WHERE user_id = ? AND message_id = ?;`
 )
 
 const (
@@ -73,7 +19,6 @@ const (
 )
 
 var (
-	db     *sql.DB
 	logger *log.Logger
 )
 
@@ -84,28 +29,11 @@ func main() {
 	}
 	defer logFile.Close()
 	logger = log.New(logFile, "", log.Ldate|log.Ltime|log.Lshortfile)
-
-	err = godotenv.Load()
-	if err != nil {
-		logger.Println("Warning: Error loading .env file, using system environment variables")
-	}
+	godotenv.Load()
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
 		logger.Fatal("DISCORD_TOKEN not set in environment")
-	}
-
-	db, err = sql.Open("sqlite3", "./bookmarks.db")
-	if err != nil {
-		logger.Fatalf("Error opening database: %v", err)
-	}
-	defer db.Close()
-
-	if _, err := db.Exec(CREATE_USER_BOOKMARKS_TABLE); err != nil {
-		logger.Fatalf("Failed to create user_bookmarks table: %v", err)
-	}
-	if _, err := db.Exec(CREATE_BOOKMARKED_MESSAGES_TABLE); err != nil {
-		logger.Fatalf("Failed to create bookmarked_messages table: %v", err)
 	}
 
 	dg, err := discordgo.New("Bot " + token)
@@ -115,7 +43,6 @@ func main() {
 
 	dg.AddHandler(reactionAdd)
 	dg.AddHandler(dmReactionAdd)
-	dg.AddHandler(reactionRemove)
 
 	dg.Identify.Intents = discordgo.IntentsGuilds |
 		discordgo.IntentsGuildMessages |
@@ -135,6 +62,19 @@ func main() {
 	<-sc
 }
 
+func extractMessageInfoFromLink(messageLink string) (channelID, messageID string, ok bool) {
+	parts := strings.Split(messageLink, "/")
+	if len(parts) < 3 {
+		logger.Printf("Error: Invalid message link format: %s", messageLink)
+		return "", "", false
+	}
+	
+	messageID = parts[len(parts)-1]
+	channelID = parts[len(parts)-2]
+	
+	return channelID, messageID, true
+}
+
 func reactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
 	if r.UserID == s.State.User.ID {
 		return
@@ -142,7 +82,7 @@ func reactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
 
 	channelInfo, err := s.Channel(r.ChannelID)
 	if err != nil {
-		logger.Printf("Error getting channel info: %v", err)
+		logger.Printf("Error getting channel info for channel %s: %v", r.ChannelID, err)
 		return
 	}
 
@@ -154,30 +94,23 @@ func reactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
 		return
 	}
 
+	logger.Printf("Processing bookmark reaction from user %s in channel %s:%s", r.UserID, r.ChannelID, r.MessageID)
+
 	msg, err := s.ChannelMessage(r.ChannelID, r.MessageID)
 	if err != nil {
-		logger.Printf("Error fetching message: %v", err)
+		logger.Printf("Error getting message %s from channel %s: %v", r.MessageID, r.ChannelID, err)
 		return
 	}
 
 	user, err := s.User(r.UserID)
 	if err != nil {
-		logger.Printf("Error fetching user: %v", err)
+		logger.Printf("Error getting user info for user %s: %v", r.UserID, err)
 		return
 	}
 
 	guild, err := s.Guild(channelInfo.GuildID)
 	if err != nil {
-		logger.Printf("Error fetching guild info: %v", err)
-		return
-	}
-
-	var exists int
-	err = db.QueryRow(CHECK_BOOKMARK_EXISTS_QUERY, r.UserID, r.MessageID).Scan(&exists)
-	if err == nil {
-		return
-	} else if err != sql.ErrNoRows {
-		logger.Printf("Error checking bookmark exists: %v", err)
+		logger.Printf("Error getting guild info for guild %s: %v", channelInfo.GuildID, err)
 		return
 	}
 
@@ -187,47 +120,22 @@ func reactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
 
 	dmChannel, err := s.UserChannelCreate(user.ID)
 	if err != nil {
-		logger.Printf("Error creating DM channel: %v", err)
+		logger.Printf("Error creating DM channel with user %s (%s): %v", user.Username, user.ID, err)
 		return
 	}
 
 	sentMsg, err := s.ChannelMessageSendEmbed(dmChannel.ID, embed)
 	if err != nil {
-		logger.Printf("Error sending DM embed: %v", err)
+		logger.Printf("Error sending bookmark embed to user %s (%s): %v", user.Username, user.ID, err)
 		return
 	}
 
 	err = s.MessageReactionAdd(dmChannel.ID, sentMsg.ID, DELETE_EMOJI)
 	if err != nil {
-		logger.Printf("Error adding removal reaction to DM: %v", err)
+		logger.Printf("Error adding delete reaction to bookmark message for user %s: %v", user.Username, err)
 	}
 
-	tx, err := db.Begin()
-	if err != nil {
-		logger.Printf("Error beginning transaction: %v", err)
-		return
-	}
-
-	_, err = tx.Exec(INSERT_USER_BOOKMARK_QUERY,
-		channelInfo.GuildID, r.ChannelID, r.UserID, r.MessageID, messageLink, sentMsg.ID)
-	if err != nil {
-		tx.Rollback()
-		logger.Printf("Error inserting user bookmark: %v", err)
-		return
-	}
-
-	_, err = tx.Exec(UPDATE_BOOKMARK_COUNT_QUERY,
-		channelInfo.GuildID, r.ChannelID, r.MessageID, msg.Author.ID, messageLink)
-	if err != nil {
-		tx.Rollback()
-		logger.Printf("Error updating bookmark count: %v", err)
-		return
-	}
-
-	if err = tx.Commit(); err != nil {
-		logger.Printf("Error committing transaction: %v", err)
-		return
-	}
+	logger.Printf("Successfully sent bookmark to user %s (%s) from guild %s", user.Username, user.ID, guild.Name)
 }
 
 func dmReactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
@@ -237,7 +145,7 @@ func dmReactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
 
 	channelInfo, err := s.Channel(r.ChannelID)
 	if err != nil {
-		logger.Printf("Error getting channel info: %v", err)
+		logger.Printf("Error getting DM channel info for channel %s: %v", r.ChannelID, err)
 		return
 	}
 
@@ -249,139 +157,56 @@ func dmReactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
 		return
 	}
 
-	var messageID string
-	var channelID string
-	err = db.QueryRow("SELECT message_id, channel_id FROM user_bookmarks WHERE user_id = ? AND dm_message_id = ?",
-		r.UserID, r.MessageID).Scan(&messageID, &channelID)
+	logger.Printf("Processing delete reaction from user %s in DM", r.UserID)
+
+	msg, err := s.ChannelMessage(r.ChannelID, r.MessageID)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return
+		logger.Printf("Error getting DM message %s from channel %s: %v", r.MessageID, r.ChannelID, err)
+		return
+	}
+
+	if len(msg.Embeds) == 0 {
+		logger.Printf("Warning: User %s reacted to delete on a message with no embeds", r.UserID)
+		return
+	}
+
+	embed := msg.Embeds[0]
+	var messageLink string
+	
+	for _, field := range embed.Fields {
+		if field.Name == "Source" {
+			start := strings.Index(field.Value, "(")
+			end := strings.Index(field.Value, ")")
+			if start != -1 && end != -1 && end > start {
+				messageLink = field.Value[start+1 : end]
+			}
+			break
 		}
-		logger.Printf("Error getting bookmark message ID: %v", err)
+	}
+
+	if messageLink == "" {
+		logger.Printf("Error: Could not extract message link from bookmark embed for user %s", r.UserID)
 		return
 	}
 
-	tx, err := db.Begin()
-	if err != nil {
-		logger.Printf("Error beginning transaction: %v", err)
-		return
-	}
-
-	_, err = tx.Exec(DECREMENT_BOOKMARK_COUNT_QUERY, r.UserID, r.MessageID)
-	if err != nil {
-		tx.Rollback()
-		logger.Printf("Error decrementing bookmark count: %v", err)
-		return
-	}
-
-	_, err = tx.Exec(DELETE_USER_BOOKMARK_QUERY, r.UserID, r.MessageID)
-	if err != nil {
-		tx.Rollback()
-		logger.Printf("Error deleting user bookmark: %v", err)
-		return
-	}
-
-	_, err = tx.Exec(DELETE_ZERO_BOOKMARKS_QUERY)
-	if err != nil {
-		tx.Rollback()
-		logger.Printf("Error deleting zero bookmark messages: %v", err)
-		return
-	}
-
-	if err = tx.Commit(); err != nil {
-		logger.Printf("Error committing transaction: %v", err)
+	channelID, messageID, ok := extractMessageInfoFromLink(messageLink)
+	if !ok {
+		logger.Printf("Error: Failed to parse message link %s for user %s", messageLink, r.UserID)
 		return
 	}
 
 	err = s.MessageReactionRemove(channelID, messageID, BOOKMARK_EMOJI, r.UserID)
 	if err != nil {
-		logger.Printf("Error removing bookmark reaction from original message: %v", err)
+		logger.Printf("Error removing bookmark reaction from original message (channel: %s, message: %s, user: %s): %v", channelID, messageID, r.UserID, err)
 	}
 
 	err = s.ChannelMessageDelete(r.ChannelID, r.MessageID)
 	if err != nil {
-		logger.Printf("Error deleting bookmark message: %v", err)
-	}
-}
-
-func reactionRemove(s *discordgo.Session, r *discordgo.MessageReactionRemove) {
-	if r.UserID == s.State.User.ID {
+		logger.Printf("Error deleting bookmark message from DM (channel: %s, message: %s): %v", r.ChannelID, r.MessageID, err)
 		return
 	}
 
-	channelInfo, err := s.Channel(r.ChannelID)
-	if err != nil {
-		logger.Printf("Error getting channel info: %v", err)
-		return
-	}
-
-	if channelInfo.Type == discordgo.ChannelTypeDM {
-		return
-	}
-
-	if r.Emoji.Name != BOOKMARK_EMOJI {
-		return
-	}
-
-	var dmMessageID string
-	var dmChannelID string
-	err = db.QueryRow(GET_DM_MESSAGE_ID_QUERY, r.UserID, r.MessageID).Scan(&dmMessageID, &dmChannelID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return
-		}
-		logger.Printf("Error finding DM message ID: %v", err)
-		return
-	}
-
-	user, err := s.User(r.UserID)
-	if err != nil {
-		logger.Printf("Error fetching user: %v", err)
-		return
-	}
-
-	dmChannel, err := s.UserChannelCreate(user.ID)
-	if err != nil {
-		logger.Printf("Error creating DM channel: %v", err)
-		return
-	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		logger.Printf("Error beginning transaction: %v", err)
-		return
-	}
-
-	_, err = tx.Exec("UPDATE bookmarked_messages SET bookmark_count = bookmark_count - 1 WHERE message_id = ?", r.MessageID)
-	if err != nil {
-		tx.Rollback()
-		logger.Printf("Error decrementing bookmark count: %v", err)
-		return
-	}
-
-	_, err = tx.Exec("DELETE FROM user_bookmarks WHERE user_id = ? AND message_id = ?", r.UserID, r.MessageID)
-	if err != nil {
-		tx.Rollback()
-		logger.Printf("Error deleting user bookmark: %v", err)
-		return
-	}
-
-	_, err = tx.Exec(DELETE_ZERO_BOOKMARKS_QUERY)
-	if err != nil {
-		tx.Rollback()
-		logger.Printf("Error deleting zero bookmark messages: %v", err)
-		return
-	}
-
-	if err = tx.Commit(); err != nil {
-		logger.Printf("Error committing transaction: %v", err)
-		return
-	}
-
-	err = s.ChannelMessageDelete(dmChannel.ID, dmMessageID)
-	if err != nil {
-		logger.Printf("Error deleting bookmark message from DM: %v", err)
-	}
+	logger.Printf("Successfully processed bookmark deletion for user %s", r.UserID)
 }
 
 func createBookmarkEmbed(msg *discordgo.Message, guildName, messageLink string) *discordgo.MessageEmbed {
